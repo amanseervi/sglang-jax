@@ -823,9 +823,12 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         def _run(ql_, qpe_, kvc_, kpe_, cache_, topk_, tpages_, seq_lens_, pi_, cuq_, cukv_, dist_):
             page_size = cache_.shape[1] * cache_.shape[2]
             pages_per_seq = _seq_max_pages(pi_, seq_lens_, page_size)
-            k_pages_max = (
-                min(_PAGE_TOPK_BUDGET, pages_per_seq) + 1 if _PAGE_TOPK_BUDGET > 0 else 512
-            )
+            if _PAGE_TOPK_BUDGET > 0:
+                k_pages_max = min(_PAGE_TOPK_BUDGET, pages_per_seq) + 1
+            elif has_pages and tpages_.shape[1] < 511:
+                k_pages_max = min(tpages_.shape[1] + 2, pages_per_seq + 1)
+            else:
+                k_pages_max = 512
             if has_pages:
                 # Page lists from the prefill-form indexer (spec decode-form path)
                 # are index_topk/page_size wide; the page-level wrapper expects

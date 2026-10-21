@@ -234,7 +234,7 @@ class EAGLEWorker(BaseSpecWorker):
                         capture_hidden_mode=CaptureHiddenMode.FULL,
                         num_tokens_per_batch=np.asarray(1, dtype=np.int32),
                         num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
-                        allocate_lens=batch.seq_lens + EagleDraftInput.ALLOC_LEN_PER_DECODE,
+                        allocate_lens=batch.seq_lens + EagleDraftInput.ALLOC_LEN_PER_DECODE * 2,
                     )
 
                 def _make_relay_spec_info(batch):
@@ -243,10 +243,10 @@ class EAGLEWorker(BaseSpecWorker):
                         capture_hidden_mode=CaptureHiddenMode.FULL,
                         num_tokens_per_batch=np.asarray(1, dtype=np.int32),
                         num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
-                        allocate_lens=batch.seq_lens + EagleDraftInput.ALLOC_LEN_PER_DECODE,
+                        allocate_lens=batch.seq_lens + EagleDraftInput.ALLOC_LEN_PER_DECODE * 2,
                     )
 
-                greedy_modes = (True, False) if bs == shapes[0][0] else (False,)
+                greedy_modes = (True, False) if bs == shapes[0][0] else (True,)
                 for is_greedy in greedy_modes:
                     model_worker_batch = _make_decode_batch()
                     model_worker_batch.sampling_info.is_all_greedy = is_greedy

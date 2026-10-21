@@ -236,6 +236,24 @@ def get_tuned_fused_moe_v2_block_config(
     if cfg_tuple is None:
         cfg_tuple = _lookup(table_key_legacy)
 
+    if cfg_tuple is None and ep_size > 0 and num_tokens % ep_size == 0:
+        local_tokens = num_tokens // ep_size
+        aligned_local = 8 if local_tokens <= 8 else ((local_tokens + 7) // 8) * 8
+        pow2_local = max(1, 1 << (aligned_local.bit_length() - 1))
+        for cand_tokens in (aligned_local * ep_size, pow2_local * ep_size):
+            if cand_tokens == num_tokens:
+                continue
+            cand_key_quant = table_key_quant[:2] + (cand_tokens,) + table_key_quant[3:]
+            cand_key = cand_key_quant[:-1]
+            cand_key_legacy = cand_key[:-1]
+            cfg_tuple = (
+                _lookup(cand_key_quant)
+                or _lookup(cand_key)
+                or _lookup(cand_key_legacy)
+            )
+            if cfg_tuple is not None:
+                break
+
     if cfg_tuple is None:
         return DEFAULT_V2_BLOCK_CONFIG
 

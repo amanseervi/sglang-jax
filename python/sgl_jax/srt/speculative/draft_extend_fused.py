@@ -1133,7 +1133,7 @@ def _build_draft_extend(
         # Force P() replicated sharding only on outputs that may still be
         # materialized on host by the debug/legacy restore path. Relay buffers
         # are DP-local and must be updated with the original data-sharded values.
-        if mesh is not None:
+        if mesh is not None and not update_relay:
             rep = NamedSharding(mesh, P())
             selected_layer0_hidden = jax.sharding.reshard(selected_layer0_hidden, rep)
             stacked_idx = jax.sharding.reshard(stacked_idx, rep)
@@ -1869,8 +1869,9 @@ def _build_verify(topk: int):
         if mesh is not None:
             rep = NamedSharding(mesh, P())
             data = NamedSharding(mesh, P("data"))
+            data_2d = NamedSharding(mesh, P("data", None))
+            prepared_hidden = jax.sharding.reshard(prepared_hidden, data_2d)
             (
-                prepared_hidden,
                 prepared_verified_id,
                 prepared_new_seq_lens,
                 prepared_accept_lens_host,
@@ -1879,7 +1880,6 @@ def _build_verify(topk: int):
                 prepared_positions,
             ) = _reshard_values(
                 rep,
-                prepared_hidden,
                 prepared_verified_id,
                 prepared_new_seq_lens,
                 prepared_accept_lens_host,
@@ -2437,6 +2437,7 @@ def launch_fused_draft_extend_for_decode(
     )
     if getattr(batch_output.next_draft_input, "verify_seq_lens", None) is not None:
         draft_input.device_seq_lens_for_draft_extend = True
+    verify_seq_lens_host = np.asarray(model_worker_batch.seq_lens).copy()
     mwb, logits_metadata = draft_input.prepare_for_extend_after_verify(
         model_worker_batch,
         draft_worker.draft_model_runner,
@@ -2496,11 +2497,11 @@ def launch_fused_draft_extend_for_decode(
         # allocate_lens_for_draft_extend is a device array too (prepared during
         # verify); rebuild the padded host copy from the host-side allocate_lens
         # like the fallback above does, so the guard never touches device memory.
-        alloc_host = np.zeros_like(np.asarray(model_worker_batch.seq_lens), dtype=np.int32)
+        alloc_host = np.zeros_like(verify_seq_lens_host, dtype=np.int32)
         alloc_host[sel] = np.asarray(batch_output.next_draft_input.allocate_lens)
         chain_all_ok = chain_all_headroom_ok(
             alloc_host,
-            np.asarray(model_worker_batch.seq_lens),
+            verify_seq_lens_host,
             draft_worker.speculative_num_steps,
         )
         if not chain_all_ok and not getattr(draft_worker, "_chain_all_fallback_logged", False):
