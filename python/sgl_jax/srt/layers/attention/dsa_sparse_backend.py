@@ -281,6 +281,11 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             else layer.scaling
         )
         dpa = self.attention_data_partition_axis
+        new_k_pe = jax.sharding.reshard(new_k_pe, P(dpa, None))
+        if new_kv_c.dtype != kv_cache.dtype:
+            new_kv_c = new_kv_c.astype(kv_cache.dtype)
+        if new_k_pe.dtype != kv_cache.dtype:
+            new_k_pe = new_k_pe.astype(kv_cache.dtype)
         md = self.forward_metadata
 
         # ── dense short-circuit ────────────────────────────────────────────
@@ -503,7 +508,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         def _run(q_, k_, w_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_):
             page_size = cache_.shape[1] * cache_.shape[2]
             idx_dim = cache_.shape[3]
-            pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
+            pages_per_seq = _seq_max_pages(pi_, seq_lens_, page_size)
             cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
             cache3d = _scatter_paged(cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq)
             if compute_topk and _PAGE_TOPK_BUDGET > 0:
@@ -533,7 +538,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     w_,
                     cache3d.reshape(cache_.shape),
                     seq_lens_,
-                    _fixed_stride_pages(pi_, cukv_, page_size, pages_per_seq),
+                    pi_,
                     cuq_,
                     dist_,
                     k=self.index_topk,
@@ -541,6 +546,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     compression_ratio=1,
                     num_kv_pages_per_block=_INDEXER_KERNEL_KV_PAGES_PER_BLOCK,
                     num_queries_per_block=1,
+                    cu_kv_pages=cukv_ // page_size,
+                    pages_per_seq=pages_per_seq,
                 )
             elif compute_topk:
                 topk = streamindex_topk_ref(
@@ -622,10 +629,13 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
 
         def _run(ql_, qpe_, kvc_, kpe_, cache_, topk_, tpages_, seq_lens_, pi_, cuq_, cukv_, dist_):
             page_size = cache_.shape[1] * cache_.shape[2]
-            pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
-            k_pages_max = (
-                min(_PAGE_TOPK_BUDGET, pages_per_seq) + 1 if _PAGE_TOPK_BUDGET > 0 else 512
-            )
+            pages_per_seq = _seq_max_pages(pi_, seq_lens_, page_size)
+            if _PAGE_TOPK_BUDGET > 0:
+                k_pages_max = min(_PAGE_TOPK_BUDGET, pages_per_seq) + 1
+            elif has_pages and tpages_.shape[1] < 511:
+                k_pages_max = min(tpages_.shape[1] + 2, pages_per_seq + 1)
+            else:
+                k_pages_max = 512
             if has_pages:
                 # Page lists from the prefill-form indexer (spec decode-form path)
                 # are index_topk/page_size wide; the page-level wrapper expects
@@ -718,7 +728,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         def _run(q_, k_, w_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_):
             page_size = cache_.shape[1] * cache_.shape[2]
             idx_dim = cache_.shape[3]
-            pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
+            pages_per_seq = _seq_max_pages(pi_, seq_lens_, page_size)
             cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
             cache3d = _scatter_paged(cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq)
             if not compute_pages:
@@ -1381,15 +1391,12 @@ def _prefill_page_topk(
             w_,
             cache3d.reshape(kernel_cache_shape),
             seq_lens_,
-            # the kernel indexes page_indices[seq_id * pages_per_seq + p]
-            # (fixed stride), but sglang packs seq i's pages at
-            # cu_kv_lens[i]//page_size (variable stride) — repack, same
-            # as the decode call site, or a multi-request EXTEND batch
-            # with unequal lengths reads another sequence's pages.
-            _fixed_stride_pages(pi_, cukv_, page_size, pages_per_seq),
+            pi_,
             cuq_,
             dist_[2],
             k_pages=k_eff,
+            cu_kv_pages=cukv_ // page_size,
+            pages_per_seq=pages_per_seq,
             **(
                 {}
                 if num_queries_per_block is None
@@ -1431,6 +1438,11 @@ def _placeholder_topk_like(topk_pages: jax.Array) -> jax.Array:
     in_specs check, so derive the placeholder from the data-sharded page topk.
     """
     return jnp.full_like(topk_pages[:, :1], -1, dtype=jnp.int32)
+
+
+def _seq_max_pages(pi_: jax.Array, seq_lens_: jax.Array, page_size: int) -> int:
+    max_ctx = int(os.environ.get("SGL_MLA_MAX_PREFILL_KV_LEN", "1048576"))
+    return min(pi_.shape[0], max(pi_.shape[0] // seq_lens_.shape[0], max_ctx // page_size))
 
 
 def _fixed_stride_pages(

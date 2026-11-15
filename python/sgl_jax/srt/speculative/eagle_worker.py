@@ -127,11 +127,13 @@ class EAGLEWorker(BaseSpecWorker):
         # when the fitted spec cache_loc padding is on (the runtime fit may
         # only land on those rungs, so this precompile covers all of them).
         shapes = []
+        max_smem_tokens = dp_size * 32768 * self.page_size
         for i, bs in enumerate(self.precompile_bs_paddings):
-            legacy = (
+            legacy = min(
                 (bs * self.draft_worker.max_req_len + self.page_size - 1)
                 // self.page_size
-                * self.page_size
+                * self.page_size,
+                max_smem_tokens,
             )
             sizes = (
                 spec_cache_loc_precompile_sizes(
@@ -208,23 +210,53 @@ class EAGLEWorker(BaseSpecWorker):
                 else:
                     topk_shape = (bs, num_steps, self.topk) if is_multi_layer else (bs, self.topk)
                 data_sharding = NamedSharding(self.mesh, P("data"))
-                spec_info = EagleDraftInput(
-                    topk_p=jax.device_put(np.ones(topk_shape, dtype=np.float32), data_sharding),
-                    topk_index=jax.device_put(np.ones(topk_shape, dtype=np.int32), data_sharding),
-                    hidden_states=np.ones(
-                        (bs, self.draft_worker.model_config.hidden_size),
-                        dtype=(
-                            jnp.bfloat16 if self.server_args.dtype == "bfloat16" else np.float32
+                def _make_non_relay_spec_info(batch):
+                    return EagleDraftInput(
+                        topk_p=jax.device_put(np.ones(topk_shape, dtype=np.float32), data_sharding),
+                        topk_index=jax.device_put(
+                            np.ones(topk_shape, dtype=np.int32), data_sharding
                         ),
-                    ),
-                    verified_id=jax.device_put(np.ones((bs,), dtype=np.int32), data_sharding),
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
-                    num_tokens_per_batch=np.asarray(1, dtype=np.int32),
-                    num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
-                    allocate_lens=model_worker_batch.seq_lens
-                    + EagleDraftInput.ALLOC_LEN_PER_DECODE,
-                )
-                if self.spec_relay_buffers is not None:
+                        hidden_states=np.ones(
+                            (bs, self.draft_worker.model_config.hidden_size),
+                            dtype=(
+                                jnp.bfloat16 if self.server_args.dtype == "bfloat16" else np.float32
+                            ),
+                        ),
+                        verified_id=jax.device_put(np.ones((bs,), dtype=np.int32), data_sharding),
+                        capture_hidden_mode=CaptureHiddenMode.FULL,
+                        num_tokens_per_batch=np.asarray(1, dtype=np.int32),
+                        num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
+                        allocate_lens=batch.seq_lens + EagleDraftInput.ALLOC_LEN_PER_DECODE * 2,
+                    )
+
+                def _make_relay_spec_info(batch):
+                    return EagleDraftInput(
+                        future_indices=np.asarray(batch.req_pool_indices, dtype=np.int32),
+                        capture_hidden_mode=CaptureHiddenMode.FULL,
+                        num_tokens_per_batch=np.asarray(1, dtype=np.int32),
+                        num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
+                        allocate_lens=batch.seq_lens + EagleDraftInput.ALLOC_LEN_PER_DECODE * 2,
+                    )
+
+                greedy_modes = (True, False) if bs == shapes[0][0] else (True,)
+                for is_greedy in greedy_modes:
+                    model_worker_batch = _make_decode_batch()
+                    model_worker_batch.sampling_info.is_all_greedy = is_greedy
+                    spec_info = _make_non_relay_spec_info(model_worker_batch)
+                    if self.spec_relay_buffers is not None:
+                        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+                        model_worker_batch.spec_info_padded = spec_info
+                        model_worker_batch.speculative_eagle_topk = self.topk
+                        model_worker_batch.speculative_num_draft_tokens = (
+                            self.speculative_num_draft_tokens
+                        )
+                        model_worker_batch.speculative_num_steps = self.speculative_num_steps
+                        self.forward_batch_speculative_decode_overlap(model_worker_batch)
+                        jax.block_until_ready(self.spec_relay_buffers)
+
+                        model_worker_batch = _make_decode_batch()
+                        model_worker_batch.sampling_info.is_all_greedy = is_greedy
+                        spec_info = _make_relay_spec_info(model_worker_batch)
                     model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
                     model_worker_batch.spec_info_padded = spec_info
                     model_worker_batch.speculative_eagle_topk = self.topk
@@ -232,30 +264,11 @@ class EAGLEWorker(BaseSpecWorker):
                         self.speculative_num_draft_tokens
                     )
                     model_worker_batch.speculative_num_steps = self.speculative_num_steps
-                    self.forward_batch_speculative_decode_overlap(model_worker_batch)
-                    jax.block_until_ready(self.spec_relay_buffers)
-
-                    model_worker_batch = _make_decode_batch()
-                    spec_info = EagleDraftInput(
-                        future_indices=np.asarray(
-                            model_worker_batch.req_pool_indices, dtype=np.int32
-                        ),
-                        capture_hidden_mode=CaptureHiddenMode.FULL,
-                        num_tokens_per_batch=np.asarray(1, dtype=np.int32),
-                        num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
-                        allocate_lens=model_worker_batch.seq_lens
-                        + EagleDraftInput.ALLOC_LEN_PER_DECODE,
-                    )
-                model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-                model_worker_batch.spec_info_padded = spec_info
-                model_worker_batch.speculative_eagle_topk = self.topk
-                model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
-                model_worker_batch.speculative_num_steps = self.speculative_num_steps
-                if self.spec_relay_buffers is not None:
-                    self.forward_batch_speculative_decode_overlap(model_worker_batch)
-                    jax.block_until_ready(self.spec_relay_buffers)
-                else:
-                    self.forward_batch_speculative_generation(model_worker_batch)
+                    if self.spec_relay_buffers is not None:
+                        self.forward_batch_speculative_decode_overlap(model_worker_batch)
+                        jax.block_until_ready(self.spec_relay_buffers)
+                    else:
+                        self.forward_batch_speculative_generation(model_worker_batch)
 
         end_time = time.perf_counter()
         logger.info("[SPEC_DECODE] Precompile finished in %.0f secs", end_time - start_time)

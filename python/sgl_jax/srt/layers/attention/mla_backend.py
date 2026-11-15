@@ -303,6 +303,10 @@ class MLAAttentionBackend(AttentionBackend):
         q_pe = q_rope
 
         cache = token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
+        if new_kv_c.dtype != cache.dtype:
+            new_kv_c = new_kv_c.astype(cache.dtype)
+        if new_k_pe.dtype != cache.dtype:
+            new_k_pe = new_k_pe.astype(cache.dtype)
         sm_scale = (
             (1.0 / jnp.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim))
             if (layer is None or layer.scaling is None)
@@ -390,7 +394,7 @@ class MLAAttentionBackend(AttentionBackend):
         assert (
             res > 0
         ), f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
-        return res
+        return max(64, res)
 
     def get_eagle_base_metadata(self, batch, **kwargs):
         """Metadata for the fused speculative JITs that rebuild dynamic fields on device.

@@ -199,7 +199,7 @@ class CompilationManager:
     def _compute_bs_buckets(self, user_paddings: list[int] | None) -> list[int]:
         bs_list = user_paddings if user_paddings is not None else PRECOMPILE_DEFAULT_BS_PADDINGS
         is_fused_moe = self.moe_backend in ("fused", "fused_v2")
-        min_fused_bs = self.tp_size * 2
+        min_fused_bs = self.tp_size if self.moe_backend == "fused_v2" else self.tp_size * 2
         if is_fused_moe and self.max_padded_batch_size < min_fused_bs:
             raise ValueError(
                 f"max_padded_batch_size={self.max_padded_batch_size} is below the fused-MoE "
@@ -223,17 +223,20 @@ class CompilationManager:
     def _compute_cache_loc_buckets(self) -> list[int]:
         # bs reqs together can never exceed max_total_num_tokens, so cap the
         # per-bs bucket at the pool size (helps Pathways gRPC H2D; see tp_worker
-        # for why the cap is proxy-only).
+        # for why the cap is proxy-only). Also cap at 32,768 pages per DP rank
+        # (128 KiB in TPU SMEM; 2M-4M tokens/rank) since all paged kernels
+        # index packed page_indices via cu_kv_lens // page_size.
         pages_per_req = (self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
-        pool_aligned = (
-            (self.max_total_num_tokens + self.page_size - 1) // self.page_size * self.page_size
+        max_smem_tokens = self.dp_size * 32768 * self.page_size
+        cap = (
+            min(
+                (self.max_total_num_tokens + self.page_size - 1) // self.page_size * self.page_size,
+                max_smem_tokens,
+            )
             if self.max_total_num_tokens
-            else None
+            else max_smem_tokens
         )
-        return [
-            min(bs * pages_per_req, pool_aligned) if pool_aligned else bs * pages_per_req
-            for bs in self.bs_buckets
-        ]
+        return [min(bs * pages_per_req, cap) for bs in self.bs_buckets]
 
     # ---- Pre-compilation ----
 
