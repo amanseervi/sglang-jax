@@ -488,6 +488,14 @@ class FusedEPMoE(nnx.Module):
     ) -> jax.Array:
         """Forward pass through the fused MoE layer."""
         assert hidden_states.ndim == 2
+        orig_num_tokens = hidden_states.shape[0]
+        mesh_ep_size = self.mesh.shape["data"] * self.mesh.shape["tensor"]
+        if orig_num_tokens % mesh_ep_size != 0:
+            padded_num_tokens = ((orig_num_tokens + mesh_ep_size - 1) // mesh_ep_size) * mesh_ep_size
+            pad_t = padded_num_tokens - orig_num_tokens
+            hidden_states = jnp.pad(hidden_states, ((0, pad_t), (0, 0)))
+            topk_weights = jnp.pad(topk_weights, ((0, pad_t), (0, 0)), constant_values=0.0)
+            topk_ids = jnp.pad(topk_ids, ((0, pad_t), (0, 0)), constant_values=-1)
 
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
@@ -553,6 +561,8 @@ class FusedEPMoE(nnx.Module):
         if out_sharding is None:
             out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * output.ndim)))
         output = jax.sharding.reshard(output, out_sharding)
+        if orig_num_tokens != output.shape[0]:
+            output = output[:orig_num_tokens]
         return output
 
 
@@ -580,6 +590,14 @@ class FusedEPMoEV2(FusedEPMoE):
         )
 
         assert hidden_states.ndim == 2
+        orig_num_tokens = hidden_states.shape[0]
+        mesh_ep_size = self.mesh.shape["data"] * self.mesh.shape["tensor"]
+        if orig_num_tokens % mesh_ep_size != 0:
+            padded_num_tokens = ((orig_num_tokens + mesh_ep_size - 1) // mesh_ep_size) * mesh_ep_size
+            pad_t = padded_num_tokens - orig_num_tokens
+            hidden_states = jnp.pad(hidden_states, ((0, pad_t), (0, 0)))
+            topk_weights = jnp.pad(topk_weights, ((0, pad_t), (0, 0)), constant_values=0.0)
+            topk_ids = jnp.pad(topk_ids, ((0, pad_t), (0, 0)), constant_values=-1)
 
         w1_scale = self.w1_scale.value if self.w1_scale is not None else None
         w3_scale = self.w3_scale.value if self.w3_scale is not None else None
@@ -676,4 +694,6 @@ class FusedEPMoEV2(FusedEPMoE):
             output = jax.sharding.reshard(
                 output, jax.sharding.NamedSharding(self.mesh, P("data", None))
             )
+        if orig_num_tokens != output.shape[0]:
+            output = output[:orig_num_tokens]
         return output

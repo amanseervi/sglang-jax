@@ -127,7 +127,8 @@ class EAGLEWorker(BaseSpecWorker):
         # when the fitted spec cache_loc padding is on (the runtime fit may
         # only land on those rungs, so this precompile covers all of them).
         shapes = []
-        max_smem_tokens = dp_size * 32768 * self.page_size
+        max_smem_pages = 40960 if dp_size == 1 else 32768
+        max_smem_tokens = dp_size * max_smem_pages * self.page_size
         for i, bs in enumerate(self.precompile_bs_paddings):
             legacy = min(
                 (bs * self.draft_worker.max_req_len + self.page_size - 1)
@@ -238,7 +239,13 @@ class EAGLEWorker(BaseSpecWorker):
                         allocate_lens=batch.seq_lens + EagleDraftInput.ALLOC_LEN_PER_DECODE * 2,
                     )
 
-                greedy_modes = (True, False) if bs == shapes[0][0] else (True,)
+                import os
+
+                greedy_modes = (
+                    (True, False)
+                    if os.environ.get("SGLANG_JAX_PRECOMPILE_BOTH_GREEDY", "0") == "1"
+                    else (False,)
+                )
                 for is_greedy in greedy_modes:
                     model_worker_batch = _make_decode_batch()
                     model_worker_batch.sampling_info.is_all_greedy = is_greedy
