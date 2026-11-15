@@ -1785,13 +1785,255 @@ def get_gen_prefix_cache_path(args, tokenizer):
     cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
 
     # Create a unique cache filename based on the generation parameters
+    real_tag = "_real" if getattr(args, "gsp_real_corpus_dir", "") else ""
+    q_seed = getattr(args, "gsp_question_seed", None)
+    q_tag = f"q{q_seed}_" if (q_seed is not None and q_seed >= 0 and not real_tag) else ""
     cache_key = (
-        f"gen_shared_prefix_{args.seed}_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
+        f"gen_shared_prefix{real_tag}_{args.seed}_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
         f"{args.gsp_system_prompt_len}_{args.gsp_question_len}_{args.gsp_output_len}_"
-        f"q{getattr(args, 'gsp_question_seed', None)}_"
-        f"{tokenizer.__class__.__name__}.pkl"
+        f"{q_tag}{tokenizer.__class__.__name__}.pkl"
     )
     return cache_dir / cache_key
+
+
+def _clean_gutenberg_text(raw_text: str) -> str:
+    """Strip Project Gutenberg license header/footer boilerplate and normalize blank lines."""
+    import re
+
+    start_markers = ["*** START OF THE PROJECT GUTENBERG EBOOK", "*** START OF THIS PROJECT GUTENBERG EBOOK"]
+    end_markers = ["*** END OF THE PROJECT GUTENBERG EBOOK", "*** END OF THIS PROJECT GUTENBERG EBOOK"]
+    text = raw_text.replace("\r\n", "\n")
+    for marker in start_markers:
+        idx = text.find(marker)
+        if idx != -1:
+            nl = text.find("\n", idx)
+            if nl != -1:
+                text = text[nl + 1 :]
+            break
+    for marker in end_markers:
+        idx = text.find(marker)
+        if idx != -1:
+            text = text[:idx]
+            break
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def build_real_world_shared_prefix_requests(
+    corpus_dir: str,
+    num_prompts: int,
+    target_sys_tokens: int,
+    target_total_tokens: int,
+    output_len: int,
+    tokenizer: PreTrainedTokenizerBase,
+    num_groups: int = 1,
+) -> tuple[list[DatasetRow], dict]:
+    """Build exact-token-length shared-prefix + unique-question requests from real-world books."""
+    corpus_path = Path(corpus_dir)
+    book_specs = [
+        ("moby_dick.txt", "Herman Melville — Moby-Dick; or, The Whale"),
+        ("origin_of_species.txt", "Charles Darwin — On the Origin of Species"),
+        ("war_and_peace.txt", "Leo Tolstoy — War and Peace"),
+    ]
+    book_texts = []
+    for fname, title in book_specs:
+        fpath = corpus_path / fname
+        if fpath.exists():
+            cleaned = _clean_gutenberg_text(fpath.read_text(encoding="utf-8", errors="ignore"))
+            book_texts.append((title, cleaned))
+    if not book_texts:
+        for fpath in sorted(corpus_path.glob("*.txt")):
+            cleaned = _clean_gutenberg_text(fpath.read_text(encoding="utf-8", errors="ignore"))
+            book_texts.append((fpath.stem, cleaned))
+    if not book_texts:
+        raise FileNotFoundError(f"No .txt files found in corpus_dir={corpus_dir}")
+
+    sys_header = (
+        "You are an expert literary, scientific, and historical analyst. Below is a comprehensive "
+        "multi-volume reference anthology containing unabridged excerpts from classic literary, "
+        "scientific, and historical works (Herman Melville's Moby-Dick, Charles Darwin's On the Origin "
+        "of Species, and Leo Tolstoy's War and Peace). Read the reference anthology and the specific "
+        "target passage that follows, then provide an in-depth, well-reasoned analytical essay.\n\n"
+        "=== BEGIN MULTI-VOLUME REFERENCE ANTHOLOGY ===\n\n"
+    )
+    sys_footer = "\n\n=== END MULTI-VOLUME REFERENCE ANTHOLOGY ==="
+
+    # Take equal token slices from each book to form the 92,160-token shared system prompt (Group 0)
+    per_book_sys_tokens = (target_sys_tokens // len(book_texts)) + 512
+    book_token_pools = []
+    all_book_ids = []
+    sys_body_parts = []
+    for title, text in book_texts:
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        all_book_ids.extend(ids)
+        section_header = f"--- VOLUME EXCERPT: {title} ---\n\n"
+        take = min(per_book_sys_tokens, len(ids) // 2)
+        chunk_text = tokenizer.decode(ids[:take], skip_special_tokens=True)
+        sys_body_parts.append(section_header + chunk_text)
+        # Remaining tokens of each book are reserved for disjoint unique question passages
+        book_token_pools.append((title, ids[take:]))
+
+    footer_ids = tokenizer.encode(sys_footer, add_special_tokens=False)
+
+    def _converge_sys_prompt(raw_sys_ids: list[int]) -> tuple[str, list[int]]:
+        sys_start = 0
+        while True:
+            body_budget = target_sys_tokens - len(footer_ids)
+            seen_sys_budgets = set()
+            while True:
+                seen_sys_budgets.add(body_budget)
+                trimmed_ids = raw_sys_ids[sys_start : sys_start + body_budget] + footer_ids
+                cand_prompt = tokenizer.decode(trimmed_ids, skip_special_tokens=True)
+                cand_ids = tokenizer.encode(cand_prompt)
+                diff = len(cand_ids) - target_sys_tokens
+                if diff == 0:
+                    break
+                next_budget = (
+                    body_budget - (1 if diff > 0 else -1) if abs(diff) == 1 else body_budget - diff
+                )
+                if next_budget in seen_sys_budgets:
+                    sys_start += 1
+                    break
+                body_budget = next_budget
+            if len(cand_ids) == target_sys_tokens:
+                return cand_prompt, cand_ids
+
+    combined_sys_raw = sys_header + "\n\n".join(sys_body_parts) + sys_footer
+    raw_sys0_ids = tokenizer.encode(combined_sys_raw, add_special_tokens=False)
+    sys_prompt, sys_ids = _converge_sys_prompt(raw_sys0_ids)
+
+    sys_prompts = [sys_prompt]
+    sys_ids_list = [sys_ids]
+    max_groups = max(1, int(num_groups))
+    if max_groups > 1:
+        doubled_corpus_ids = all_book_ids + all_book_ids
+        group_stride = max(1, len(all_book_ids) // 16)
+        for g in range(1, max_groups):
+            g_header = (
+                f"You are an expert literary, scientific, and historical analyst. "
+                f"[REFERENCE ANTHOLOGY VOLUME SET #{g + 1} OF {max_groups}] "
+                f"Below is Volume Set #{g + 1} containing unabridged excerpts from classic literary, "
+                f"scientific, and historical works. Read this reference anthology and the specific "
+                f"target passage that follows, then provide an in-depth, well-reasoned analytical essay.\n\n"
+                f"=== BEGIN REFERENCE ANTHOLOGY VOLUME SET #{g + 1} ===\n\n"
+            )
+            g_head_ids = tokenizer.encode(g_header, add_special_tokens=False)
+            g_offset = (g * group_stride) % len(all_book_ids)
+            g_raw_ids = (
+                g_head_ids
+                + doubled_corpus_ids[g_offset : g_offset + target_sys_tokens + 1024]
+            )
+            g_prompt, g_ids = _converge_sys_prompt(g_raw_ids)
+            sys_prompts.append(g_prompt)
+            sys_ids_list.append(g_ids)
+
+    # Concatenate remaining tokens across all books into a single large non-repeating pool (>850k tokens)
+    remaining_pool = []
+    pool_sources = []
+    for title, rem_ids in book_token_pools:
+        start_tok = len(remaining_pool)
+        remaining_pool.extend(rem_ids)
+        pool_sources.append((title, start_tok, len(remaining_pool)))
+
+    target_q_tokens = target_total_tokens - target_sys_tokens
+    stride = max(target_q_tokens + 256, len(remaining_pool) // max(1, num_prompts))
+
+    prompts_per_group = max(1, num_prompts // max_groups)
+    rows = []
+    question_meta = []
+    for idx in range(num_prompts):
+        g_idx = min(max_groups - 1, idx // prompts_per_group)
+        cur_sys_prompt = sys_prompts[g_idx]
+        cur_sys_ids = sys_ids_list[g_idx]
+        q_header = f"=== BEGIN TARGET PASSAGE {idx + 1} ===\n\n"
+        q_instruction = (
+            f"\n\n=== END TARGET PASSAGE {idx + 1} ===\n\n"
+            f"Analytical Question {idx + 1}: Based on the reference anthology and Target Passage {idx + 1} "
+            f"above, provide a comprehensive, detailed analysis covering: (1) the central thesis, narrative "
+            f"events, or scientific arguments in Target Passage {idx + 1}; (2) how the author develops the key "
+            f"concepts, characters, or empirical observations; (3) the stylistic, rhetorical, and structural "
+            f"techniques used; and (4) how this passage connects to the broader themes of the work. Write a "
+            f"thorough, multi-paragraph analytical response.\n\n"
+            f"Detailed Analysis of Passage {idx + 1}:\n"
+        )
+        q_header_ids = tokenizer.encode(q_header, add_special_tokens=False)
+        q_instr_ids = tokenizer.encode(q_instruction, add_special_tokens=False)
+        passage_budget = target_q_tokens - len(q_header_ids) - len(q_instr_ids)
+
+        start_offset = (idx * stride) % max(1, len(remaining_pool) - passage_budget - 512)
+        source_book = "Corpus"
+        for b_title, b_start, b_end in pool_sources:
+            if b_start <= start_offset < b_end:
+                source_book = b_title
+                break
+
+        while True:
+            cur_budget = passage_budget
+            for _ in range(8):
+                passage_slice = remaining_pool[start_offset : start_offset + cur_budget]
+                q_ids = q_header_ids + passage_slice + q_instr_ids
+                q_text = tokenizer.decode(q_ids, skip_special_tokens=True)
+                q_reencoded = tokenizer.encode("\n\n" + q_text, add_special_tokens=False)
+                diff = (len(cur_sys_ids) + len(q_reencoded)) - target_total_tokens
+                if diff == 0:
+                    break
+                cur_budget -= (1 if diff > 0 else -1) if abs(diff) == 1 else diff
+
+            seen_budgets = set()
+            while True:
+                seen_budgets.add(cur_budget)
+                passage_slice = remaining_pool[start_offset : start_offset + cur_budget]
+                q_ids = q_header_ids + passage_slice + q_instr_ids
+                q_text = tokenizer.decode(q_ids, skip_special_tokens=True)
+                full_text = f"{cur_sys_prompt}\n\n{q_text}"
+                full_ids = tokenizer.encode(full_text)
+                diff = len(full_ids) - target_total_tokens
+                if diff == 0:
+                    break
+                next_budget = cur_budget - (1 if diff > 0 else -1) if abs(diff) == 1 else cur_budget - diff
+                if next_budget in seen_budgets:
+                    start_offset += 1
+                    break
+                cur_budget = next_budget
+            if len(full_ids) == target_total_tokens:
+                break
+
+        rows.append(
+            DatasetRow(
+                prompt=full_text,
+                prompt_len=len(full_ids),
+                output_len=output_len,
+                routing_key=None,
+            )
+        )
+        if idx < 8:
+            question_meta.append(
+                {
+                    "question_index": idx,
+                    "prefix_group": g_idx,
+                    "source_book": source_book,
+                    "pool_token_offset": start_offset,
+                    "passage_tokens": cur_budget,
+                    "total_prompt_tokens": len(full_ids),
+                    "question_head_300_chars": q_text[:300],
+                    "question_tail_500_chars": q_text[-500:],
+                }
+            )
+
+    meta = {
+        "num_groups": max_groups,
+        "target_sys_tokens": target_sys_tokens,
+        "actual_sys_tokens": [len(x) for x in sys_ids_list],
+        "target_total_tokens": target_total_tokens,
+        "output_len": output_len,
+        "num_prompts": num_prompts,
+        "remaining_pool_tokens": len(remaining_pool),
+        "stride_tokens": stride,
+        "sys_prompt_head_400_chars": sys_prompt[:400],
+        "sys_prompt_tail_400_chars": sys_prompt[-400:],
+        "sample_questions": question_meta,
+    }
+    return rows, meta
 
 
 def sample_generated_shared_prefix_requests(
@@ -1816,6 +2058,30 @@ def sample_generated_shared_prefix_requests(
         print(f"\nLoading cached generated input data from {cache_path}")
         with open(cache_path, "rb") as f:
             return pickle.load(f)
+
+    real_corpus_dir = getattr(args, "gsp_real_corpus_dir", "")
+    if real_corpus_dir:
+        target_sys_tokens = int(os.environ.get("SGL_PD_SHARED_PREFIX_LEN", "92160"))
+        target_total_tokens = system_prompt_len + question_len
+        print(
+            f"\nBuilding real-world shared-prefix dataset from {real_corpus_dir} "
+            f"(target_sys_tokens={target_sys_tokens}, target_total_tokens={target_total_tokens}, "
+            f"prompts={num_groups * prompts_per_group}, output_len={output_len})..."
+        )
+        rows, _ = build_real_world_shared_prefix_requests(
+            corpus_dir=real_corpus_dir,
+            num_prompts=num_groups * prompts_per_group,
+            target_sys_tokens=target_sys_tokens,
+            target_total_tokens=target_total_tokens,
+            output_len=output_len,
+            tokenizer=tokenizer,
+            num_groups=num_groups,
+        )
+        if should_cache:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, "wb") as f:
+                pickle.dump(rows, f)
+        return rows
 
     print(
         f"\nGenerating new input data... "

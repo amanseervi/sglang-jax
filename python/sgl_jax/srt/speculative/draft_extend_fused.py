@@ -1971,6 +1971,7 @@ def _build_prefill(num_layers: int, topk: int, hidden_relay=None):
         relay_buffers,
         relay_future_indices,
         relay_valid_mask,
+        chunk_next_token_ids=None,
         *,
         num_layers,
         dp_size,
@@ -1990,10 +1991,15 @@ def _build_prefill(num_layers: int, topk: int, hidden_relay=None):
         target_logits = target_output.next_token_logits
         target_hidden = target_output.hidden_states
         next_token_ids = argmax_with_dp_sharding(target_logits)
+        rotate_verified_ids = (
+            jnp.where(chunk_next_token_ids >= 0, chunk_next_token_ids, next_token_ids)
+            if chunk_next_token_ids is not None
+            else next_token_ids
+        )
         input_ids = _rotate_prefill_input_ids(
             draft_forward_batch.input_ids,
             draft_forward_batch.extend_seq_lens,
-            next_token_ids,
+            rotate_verified_ids,
             dp_size,
             per_dp_bs,
         )
@@ -2852,6 +2858,18 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         )
 
     data_sharding = NamedSharding(draft_worker.mesh, P("data"))
+    extend_next_token_ids = getattr(model_worker_batch, "extend_next_token_ids", None)
+    if extend_next_token_ids is None:
+        extend_next_token_ids = np.full(
+            (model_worker_batch.req_pool_indices.shape[0],), -1, dtype=np.int32
+        )
+    else:
+        extend_next_token_ids = np.asarray(extend_next_token_ids, dtype=np.int32)
+    chunk_next_token_ids = _prepare_device_array(
+        extend_next_token_ids,
+        data_sharding,
+        "prefill.chunk_next_token_ids",
+    )
     relay_buffers = getattr(spec_worker, "spec_relay_buffers", None)
     valid_mask = make_dp_valid_mask(
         model_worker_batch.real_bs_per_dp,
@@ -2894,6 +2912,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
             relay_buffers,
             relay_future_indices,
             relay_valid_mask,
+            chunk_next_token_ids,
             num_layers=draft_worker.speculative_num_steps,
             dp_size=model_worker_batch.dp_size,
             per_dp_bs=model_worker_batch.per_dp_bs_size,

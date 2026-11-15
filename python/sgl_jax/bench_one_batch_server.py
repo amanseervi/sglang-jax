@@ -19,6 +19,7 @@ import multiprocessing
 import os
 import time
 
+import numpy as np
 import requests
 
 from sgl_jax.bench_serving import (
@@ -64,6 +65,8 @@ class BenchArgs:
     gsp_num_turns: int = 1
     gsp_fast_prepare: bool = False
     gsp_ordered: bool = False
+    gsp_real_corpus_dir: str = ""
+    save_responses_dir: str = ""
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -120,6 +123,8 @@ class BenchArgs:
         parser.add_argument("--gsp-num-turns", type=int, default=BenchArgs.gsp_num_turns)
         parser.add_argument("--gsp-fast-prepare", action="store_true", default=BenchArgs.gsp_fast_prepare)
         parser.add_argument("--gsp-ordered", action="store_true", default=BenchArgs.gsp_ordered)
+        parser.add_argument("--gsp-real-corpus-dir", type=str, default=BenchArgs.gsp_real_corpus_dir)
+        parser.add_argument("--save-responses-dir", type=str, default=BenchArgs.save_responses_dir)
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -229,6 +234,18 @@ def run_one_case(
     if profile:
         profile_link: str = run_profile(url, 3, ["CPU", "GPU"], None, None, profile_by_stage)
 
+    pre_info = requests.get(url + "/get_server_info").json()
+    pre_state = pre_info["internal_states"][0] if pre_info.get("internal_states") else {}
+    pre_cum_accept_len = pre_state.get("cum_spec_accept_length", 0)
+    pre_cum_accept_cnt = pre_state.get("cum_spec_accept_count", 0)
+
+    generated_texts = [""] * batch_size
+    completion_tokens_per_req = [0] * batch_size
+    cached_tokens_per_req = [0] * batch_size
+    req_ttfts = [0.0] * batch_size
+    req_finish_times = [0.0] * batch_size
+    ttft_first = 0.0
+
     tic = time.perf_counter()
 
     if api_type == "openai":
@@ -281,6 +298,7 @@ def run_one_case(
                     for choice in data["choices"]:
                         if choice.get("text") and not first_token_received:
                             ttft = time.perf_counter() - tic
+                            ttft_first = ttft
                             first_token_received = True
                             break
                     total_chunks += 1
@@ -306,9 +324,10 @@ def run_one_case(
             url + "/generate",
             json=json_data,
             stream=True,
+            timeout=3600,
         )
 
-        # The TTFT of the last request in the batch
+        # The TTFT of the last request in the batch (matching 85f4dd1 reference doc)
         ttft = 0.0
         for chunk in response.iter_lines(decode_unicode=False):
             chunk = chunk.decode("utf-8")
@@ -323,39 +342,183 @@ def run_one_case(
                     data["meta_info"]["finish_reason"] is None
                     or data["meta_info"]["finish_reason"]["type"] == "length"
                 )
-                if data["meta_info"]["completion_tokens"] == 1:
-                    ttft = time.perf_counter() - tic
+                now_rel = time.perf_counter() - tic
+                idx = data.get("index", 0)
+                if 0 <= idx < batch_size:
+                    if "text" in data:
+                        generated_texts[idx] = data["text"]
+                    completion_tokens_per_req[idx] = data["meta_info"].get("completion_tokens", 0)
+                    cached_tokens_per_req[idx] = data["meta_info"].get("cached_tokens", 0)
+                    if req_ttfts[idx] == 0.0 and completion_tokens_per_req[idx] >= 1:
+                        req_ttfts[idx] = now_rel
+                    req_finish_times[idx] = now_rel
+                comp_toks = data["meta_info"].get("completion_tokens", 0)
+                if comp_toks >= 1 and ttft_first == 0.0:
+                    ttft_first = now_rel
+                if comp_toks == 1:
+                    ttft = now_rel
+        if ttft == 0.0 and ttft_first > 0.0:
+            ttft = ttft_first
 
     latency = time.perf_counter() - tic
     input_throughput = batch_size * input_len / ttft
     output_throughput = batch_size * output_len / (latency - ttft)
+    true_decode_window_throughput = (
+        batch_size * output_len / (latency - ttft_first) if (latency - ttft_first) > 0 else 0.0
+    )
     overall_throughput = batch_size * (input_len + output_len) / latency
 
     server_info = requests.get(url + "/get_server_info").json()
-    acc_length = server_info["internal_states"][0].get("avg_spec_accept_length", None)
-    last_gen_throughput = server_info["internal_states"][0]["last_gen_throughput"]
+    post_state = server_info["internal_states"][0] if server_info.get("internal_states") else {}
+    cum_acc_length = post_state.get("avg_spec_accept_length", None)
+    post_cum_accept_len = post_state.get("cum_spec_accept_length", 0)
+    post_cum_accept_cnt = post_state.get("cum_spec_accept_count", 0)
+    delta_len = post_cum_accept_len - pre_cum_accept_len
+    delta_cnt = post_cum_accept_cnt - pre_cum_accept_cnt
+    acc_length = (delta_len / delta_cnt) if delta_cnt > 0 else cum_acc_length
+    spec_num_draft_tokens = int(server_info.get("speculative_num_draft_tokens", 4) or 4)
+    spec_num_steps = int(server_info.get("speculative_num_steps", 3) or 3)
+    acc_rate = (acc_length / spec_num_draft_tokens) if (acc_length is not None and spec_num_draft_tokens > 0) else None
+    draft_token_acc_rate = (
+        max(0.0, (acc_length - 1.0) / spec_num_steps)
+        if (acc_length is not None and spec_num_steps > 0)
+        else None
+    )
+    mean_verify_step_ms = (
+        (latency - ttft) * 1000.0 / (output_len / acc_length)
+        if (acc_length is not None and acc_length > 0 and output_len > 0)
+        else None
+    )
+    last_gen_throughput = post_state.get("last_gen_throughput", 0.0)
 
-    print(f"batch size: {batch_size}")
+    valid_ttfts = [t for t in req_ttfts if t > 0] or [ttft]
+    ttft_mean = float(np.mean(valid_ttfts))
+    ttft_p50 = float(np.percentile(valid_ttfts, 50))
+    ttft_p90 = float(np.percentile(valid_ttfts, 90))
+    ttft_p99 = float(np.percentile(valid_ttfts, 99))
+
+    tpots_ms = [
+        (fin - first_t) * 1000.0 / max(1, output_len - 1)
+        for first_t, fin in zip(req_ttfts, req_finish_times)
+        if first_t > 0 and fin > first_t
+    ]
+    tpot_mean_ms = float(np.mean(tpots_ms)) if tpots_ms else (1000.0 / (output_throughput / batch_size))
+    tpot_p50_ms = float(np.percentile(tpots_ms, 50)) if tpots_ms else tpot_mean_ms
+    tpot_p90_ms = float(np.percentile(tpots_ms, 90)) if tpots_ms else tpot_mean_ms
+    cached_tokens_mean = float(np.mean(cached_tokens_per_req)) if cached_tokens_per_req else 0.0
+    cache_hit_rate = cached_tokens_mean / input_len if input_len > 0 else 0.0
+    num_groups_val = getattr(bench_args, "gsp_num_groups", 1) if bench_args is not None else 1
+    prompts_per_group_val = max(1, batch_size // num_groups_val)
+
+    print(f"batch size: {batch_size} (num_groups: {num_groups_val}, prompts_per_group: {prompts_per_group_val})")
     print(f"input_len: {input_len}")
     print(f"output_len: {output_len}")
     print(f"latency: {latency:.2f} s")
-    print(f"ttft: {ttft:.2f} s")
+    print(f"ttft: {ttft:.2f} s (ttft_first: {ttft_first:.2f} s, p50: {ttft_p50:.2f} s, p90: {ttft_p90:.2f} s)")
     print(f"last generation throughput: {last_gen_throughput:.2f} tok/s")
     print(f"input throughput: {input_throughput:.2f} tok/s")
     if output_len != 1:
-        print(f"output throughput: {output_throughput:.2f} tok/s")
+        print(f"output throughput: {output_throughput:.2f} tok/s (true decode window: {true_decode_window_throughput:.2f} tok/s)")
+    if acc_length is not None:
+        print(
+            f"spec accept length (batch): {acc_length:.2f} / {spec_num_draft_tokens} "
+            f"(acc_rate: {acc_rate * 100:.1f}%, draft_only_rate: {draft_token_acc_rate * 100:.1f}%, "
+            f"cumulative: {cum_acc_length:.2f}, steps: {delta_cnt}, step_ms: {mean_verify_step_ms:.2f} ms)"
+        )
+
+    save_dir = getattr(bench_args, "save_responses_dir", "") if bench_args is not None else ""
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        resp_path = os.path.join(save_dir, f"responses_bs{batch_size}.json")
+        records = []
+        for i in range(batch_size):
+            prompt_str = input_requests[i].prompt if isinstance(input_requests[i].prompt, str) else ""
+            records.append(
+                {
+                    "request_index": i,
+                    "prompt_len_tokens": input_requests[i].prompt_len,
+                    "output_len_target": input_requests[i].output_len,
+                    "completion_tokens": completion_tokens_per_req[i],
+                    "cached_tokens": cached_tokens_per_req[i],
+                    "req_ttft_s": round(req_ttfts[i], 4),
+                    "req_finish_s": round(req_finish_times[i], 4),
+                    "prompt_tail_600_chars": prompt_str[-600:] if prompt_str else "",
+                    "generated_text": generated_texts[i],
+                }
+            )
+        with open(resp_path, "w", encoding="utf-8") as f_resp:
+            json.dump(
+                {
+                    "run_name": run_name,
+                    "num_groups": num_groups_val,
+                    "prompts_per_group": prompts_per_group_val,
+                    "batch_size": batch_size,
+                    "input_len": input_len,
+                    "output_len": output_len,
+                    "latency_s": round(latency, 4),
+                    "ttft_s": round(ttft, 4),
+                    "ttft_first_s": round(ttft_first, 4),
+                    "ttft_mean_s": round(ttft_mean, 4),
+                    "ttft_p50_s": round(ttft_p50, 4),
+                    "ttft_p90_s": round(ttft_p90, 4),
+                    "ttft_p99_s": round(ttft_p99, 4),
+                    "input_throughput_tok_s": round(input_throughput, 2),
+                    "output_throughput_tok_s": round(output_throughput, 2),
+                    "true_decode_window_throughput_tok_s": round(true_decode_window_throughput, 2),
+                    "overall_throughput_tok_s": round(overall_throughput, 2),
+                    "last_gen_throughput_tok_s": round(last_gen_throughput, 2),
+                    "batch_acc_length": round(acc_length, 4) if acc_length is not None else None,
+                    "acc_rate": round(acc_rate, 4) if acc_rate is not None else None,
+                    "draft_token_acc_rate": round(draft_token_acc_rate, 4) if draft_token_acc_rate is not None else None,
+                    "cum_acc_length": round(cum_acc_length, 4) if cum_acc_length is not None else None,
+                    "decode_verify_steps": int(delta_cnt),
+                    "mean_verify_step_ms": round(mean_verify_step_ms, 2) if mean_verify_step_ms is not None else None,
+                    "tpot_mean_ms": round(tpot_mean_ms, 2),
+                    "tpot_p50_ms": round(tpot_p50_ms, 2),
+                    "tpot_p90_ms": round(tpot_p90_ms, 2),
+                    "cached_tokens_mean": round(cached_tokens_mean, 1),
+                    "cache_hit_rate": round(cache_hit_rate, 4),
+                    "responses": records,
+                },
+                f_resp,
+                indent=2,
+                ensure_ascii=False,
+            )
+        print(f"Saved {len(records)} generated responses to {resp_path}")
 
     if result_filename:
         with open(result_filename, "a") as fout:
             res = {
                 "run_name": run_name,
+                "num_groups": num_groups_val,
+                "prompts_per_group": prompts_per_group_val,
                 "batch_size": batch_size,
                 "input_len": input_len,
                 "output_len": output_len,
                 "latency": round(latency, 4),
+                "ttft": round(ttft, 4),
+                "ttft_first": round(ttft_first, 4),
+                "ttft_mean": round(ttft_mean, 4),
+                "ttft_p50": round(ttft_p50, 4),
+                "ttft_p90": round(ttft_p90, 4),
+                "ttft_p99": round(ttft_p99, 4),
+                "input_throughput": round(input_throughput, 2),
                 "output_throughput": round(output_throughput, 2),
+                "true_decode_window_throughput": round(true_decode_window_throughput, 2),
                 "overall_throughput": round(overall_throughput, 2),
                 "last_gen_throughput": round(last_gen_throughput, 2),
+                "acc_length": round(acc_length, 4) if acc_length is not None else None,
+                "acc_rate": round(acc_rate, 4) if acc_rate is not None else None,
+                "draft_token_acc_rate": round(draft_token_acc_rate, 4) if draft_token_acc_rate is not None else None,
+                "cum_acc_length": round(cum_acc_length, 4) if cum_acc_length is not None else None,
+                "decode_verify_steps": int(delta_cnt),
+                "mean_verify_step_ms": round(mean_verify_step_ms, 2) if mean_verify_step_ms is not None else None,
+                "itl_ms": round(1000.0 / (output_throughput / batch_size), 2) if output_throughput > 0 else None,
+                "tpot_mean_ms": round(tpot_mean_ms, 2),
+                "tpot_p50_ms": round(tpot_p50_ms, 2),
+                "tpot_p90_ms": round(tpot_p90_ms, 2),
+                "cached_tokens_mean": round(cached_tokens_mean, 1),
+                "cache_hit_rate": round(cache_hit_rate, 4),
             }
             fout.write(json.dumps(res) + "\n")
 
@@ -468,18 +631,31 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     if not bench_args.show_report:
         return
 
-    summary = f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
-    summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) |"
+    if bench_args.dataset_name == "generated-shared-prefix":
+        eff_input_len = bench_args.gsp_system_prompt_len + bench_args.gsp_question_len
+        eff_output_len = bench_args.gsp_output_len
+        summary = f"\nInput lens: ({eff_input_len},). Output lens: ({eff_output_len},).\n"
+    else:
+        eff_input_len = bench_args.input_len[0] if bench_args.input_len else 1024
+        eff_output_len = bench_args.output_len[0] if bench_args.output_len else 16
+        summary = f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
+
+    summary += "| batch size | latency (s) | ttft (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | req cost ($) | e2e req cost ($) |"
 
     if bench_args.profile:
         summary += " profile |"
 
     summary += "\n"
-    summary += "| ---------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |"
+    summary += "| ---------- | ----------- | -------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ | ------------ | ---------------- |"
 
     if bench_args.profile:
         summary += "-------------|"
     summary += "\n"
+
+    actual_tp_size = server_info.get("tp_size", server_args.tp_size) or 32
+    num_tpu7x_chips = (actual_tp_size // 2) if actual_tp_size > 1 else 16
+    tpu7x_chip_hourly_cost = 12.0  # $12.00/hour per TPU v7x chip (On-Demand)
+    hourly_cost = num_tpu7x_chips * tpu7x_chip_hourly_cost  # $192.00/hour for 16 TPU v7x chips
 
     for (
         batch_size,
@@ -492,18 +668,24 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         acc_length,
         trace_link,
     ) in result:
-        hourly_cost = 2 * server_args.tp_size  # $2/hour for one H100
         input_util = 0.7
         accept_length = round(acc_length, 2) if acc_length is not None else "n/a"
+        input_cost_per_1m = 1e6 / (input_throughput * input_util) / 3600 * hourly_cost
+        output_cost_per_1m = 1e6 / output_throughput / 3600 * hourly_cost
+        req_cost = (eff_input_len / 1e6) * input_cost_per_1m + (eff_output_len / 1e6) * output_cost_per_1m
+        e2e_req_cost = (latency / batch_size) / 3600 * hourly_cost
         line = (
             f"| {batch_size} | "
             f"{latency:.2f} | "
+            f"{ttft:.2f} | "
             f"{input_throughput:.2f} | "
             f"{output_throughput:.2f} | "
             f"{accept_length} | "
             f"{1 / (output_throughput / batch_size) * 1000:.2f} | "
-            f"{1e6 / (input_throughput * input_util) / 3600 * hourly_cost:.2f} | "
-            f"{1e6 / output_throughput / 3600 * hourly_cost:.2f} |"
+            f"{input_cost_per_1m:.2f} | "
+            f"{output_cost_per_1m:.2f} | "
+            f"{req_cost:.4f} | "
+            f"{e2e_req_cost:.4f} |"
         )
         if trace_link:
             line += f" [Profile]({trace_link}) |"

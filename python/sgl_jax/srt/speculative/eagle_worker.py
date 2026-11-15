@@ -241,11 +241,14 @@ class EAGLEWorker(BaseSpecWorker):
 
                 import os
 
-                greedy_modes = (
-                    (True, False)
-                    if os.environ.get("SGLANG_JAX_PRECOMPILE_BOTH_GREEDY", "0") == "1"
-                    else (False,)
-                )
+                if os.environ.get("SGLANG_PRECOMPILE_GREEDY", "0") == "1":
+                    greedy_modes = (True, False) if bs == shapes[0][0] else (True,)
+                else:
+                    greedy_modes = (
+                        (True, False)
+                        if os.environ.get("SGLANG_JAX_PRECOMPILE_BOTH_GREEDY", "0") == "1"
+                        else (False,)
+                    )
                 for is_greedy in greedy_modes:
                     model_worker_batch = _make_decode_batch()
                     model_worker_batch.sampling_info.is_all_greedy = is_greedy

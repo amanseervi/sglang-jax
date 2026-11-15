@@ -130,8 +130,10 @@ def run_eval(args):
 
     top_p = getattr(args, "top_p", None)
     chat_template_kwargs = dict(getattr(args, "chat_template_kwargs", {}) or {})
-    if getattr(args, "enable_thinking", False):
-        chat_template_kwargs["enable_thinking"] = True
+    if getattr(args, "enable_thinking", None) is not None:
+        chat_template_kwargs["enable_thinking"] = bool(args.enable_thinking)
+    if getattr(args, "reasoning_effort", None):
+        chat_template_kwargs["reasoning_effort"] = args.reasoning_effort
     args.chat_template_kwargs = chat_template_kwargs or None
     extra_body = build_extra_body(args)
 
@@ -150,17 +152,28 @@ def run_eval(args):
     latency = time.perf_counter() - tic
 
     # Dump reports
-    metrics = result.metrics | {"score": result.score}
-    file_stem = f"{args.eval_name}_{sampler.model.replace('/', '_')}"
-    report_filename = f"/tmp/{file_stem}.html"
+    output_dir = getattr(args, "output_dir", None) or "/tmp"
+    os.makedirs(output_dir, exist_ok=True)
+    tag = getattr(args, "tag", None)
+    suffix = f"_{tag}" if tag else ""
+    metrics = result.metrics | {
+        "score": result.score,
+        "latency_s": latency,
+        "eval_name": args.eval_name,
+        "num_examples": getattr(args, "num_examples", None),
+        "enable_thinking": getattr(args, "enable_thinking", False),
+        "max_tokens": max_tokens,
+        "temperature": getattr(args, "temperature", 0.0),
+    }
+    file_stem = f"{args.eval_name}{suffix}_{sampler.model.replace('/', '_')}"
+    report_filename = os.path.join(output_dir, f"{file_stem}.html")
     print(f"Writing report to {report_filename}")
     with open(report_filename, "w") as fh:
         fh.write(make_report(result))
-    metrics = result.metrics | {"score": result.score}
     print(metrics)
-    result_filename = f"/tmp/{file_stem}.json"
+    result_filename = os.path.join(output_dir, f"{file_stem}.json")
     with open(result_filename, "w") as f:
-        f.write(json.dumps(metrics, indent=2))
+        f.write(json.dumps(metrics, indent=2, default=float))
     print(f"Writing results to {result_filename}")
 
     # Print results
@@ -207,6 +220,9 @@ if __name__ == "__main__":
         default=False,
         help="Enable thinking mode for evals (true/false).",
     )
+    parser.add_argument("--reasoning-effort", type=str, default=None)
+    parser.add_argument("--output-dir", type=str, default="/tmp")
+    parser.add_argument("--tag", type=str, default=None)
     args = parser.parse_args()
 
     run_eval(args)

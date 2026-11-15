@@ -23,20 +23,61 @@ Remember to put your answer inside \\boxed{{}}."""
 
 
 def parse_answer(answer: str) -> str:
-    """Extract the answer inside \\boxed{}."""
-    # Look for the last \boxed{} in the text
+    """Extract the answer inside \\boxed{} with balanced braces or last integer fallback."""
+    if not answer:
+        return ""
+    markers = ("\\boxed{", "\\fbox{")
+    last_content = None
+    i = 0
+    while i < len(answer):
+        next_idx = -1
+        next_marker_len = 0
+        for marker in markers:
+            j = answer.find(marker, i)
+            if j != -1 and (next_idx == -1 or j < next_idx):
+                next_idx = j
+                next_marker_len = len(marker)
+        if next_idx == -1:
+            break
+        start = next_idx + next_marker_len
+        depth = 1
+        k = start
+        while k < len(answer) and depth > 0:
+            c = answer[k]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+            k += 1
+        if depth == 0:
+            last_content = answer[start : k - 1]
+            i = k
+        else:
+            break
+    if last_content is not None:
+        cleaned = re.sub(r"\\text\{([^{}]*)\}", r"\1", last_content).strip()
+        m = re.findall(r"\b\d+\b", cleaned)
+        return m[-1] if m else cleaned
     matches = re.findall(r"\\boxed\{([^{}]*)\}", answer)
     if matches:
         return matches[-1].strip()
     return ""
 
 
-def score_aime(target: str, prediction: str) -> bool:
+def _norm_int(s: str) -> str:
+    s = s.strip().replace(" ", "").replace(",", "")
+    try:
+        num = int(float(s))
+        if 0 <= num <= 999:
+            return str(num)
+    except (ValueError, TypeError):
+        pass
+    return s
+
+
+def score_aime(target: str, prediction: str) -> float:
     """Compare target and prediction answers."""
-    # Normalize: remove white spaces and commas
-    target = target.strip().replace(" ", "").replace(",", "")
-    prediction = prediction.strip().replace(" ", "").replace(",", "")
-    return target == prediction
+    return 1.0 if (_norm_int(target) != "" and _norm_int(target) == _norm_int(prediction)) else 0.0
 
 
 def get_examples(num_examples: int | None = None) -> list[dict[str, str]]:
