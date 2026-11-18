@@ -353,7 +353,15 @@ class ForwardBatch:
             and num_tokens % self.seq_lens.shape[0] == 0
         ):
             rows_per_req = num_tokens // self.seq_lens.shape[0]
-            mask = jnp.repeat(self.seq_lens > 0, rows_per_req, total_repeat_length=num_tokens)
+            # Under explicit sharding jnp.repeat needs an out_sharding. Keep the
+            # seq_lens (DP) sharding: each request's draft rows are contiguous,
+            # so rank r's rows stay on rank r.
+            mask = jnp.repeat(
+                self.seq_lens > 0,
+                rows_per_req,
+                total_repeat_length=num_tokens,
+                out_sharding=jax.typeof(self.seq_lens).sharding,
+            )
         elif self.out_cache_loc is not None and self.out_cache_loc.shape == (num_tokens,):
             mask = self.out_cache_loc > 0
         elif (
