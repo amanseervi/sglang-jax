@@ -76,6 +76,7 @@ class DpRouter:
         estimate_io,
         lookup_prefix,
         round_robin_start: int = 0,
+        prepare_probe_key=None,
     ):
         self.request_counts = list(snapshot.request_counts)
         self.input_tokens = list(snapshot.input_tokens)
@@ -85,6 +86,9 @@ class DpRouter:
         self.policy = policy
         self._estimate_io = estimate_io
         self._lookup_prefix = lookup_prefix
+        # Converts a probe key once per request (e.g. NEXTN bigram keys) so the
+        # per-rank lookups below don't each rebuild it. Identity by default.
+        self._prepare_probe_key = prepare_probe_key or (lambda token_ids: token_ids)
         self.round_robin_counter = round_robin_start
 
     def assign(self, req) -> int | None:
@@ -165,11 +169,13 @@ class DpRouter:
         token_ids, extra_key = req_prefix_match_key(req)
         matches = {}
         if token_ids:
+            # Build the cache-space key once; each rank probe reuses it.
+            probe_ids = self._prepare_probe_key(token_ids)
             # Force-cache-aware must see full holders too: defer instead of
             # silently choosing a smaller cache hit on an available rank.
             probe_ranks = range(self.dp_size) if self.policy == "force_cache_aware" else eligible
             for rank in probe_ranks:
-                matches[rank] = self._lookup_prefix(token_ids, extra_key, rank)
+                matches[rank] = self._lookup_prefix(probe_ids, extra_key, rank)
         picker = (
             pick_force_cache_aware_dp if self.policy == "force_cache_aware" else pick_cache_aware_dp
         )

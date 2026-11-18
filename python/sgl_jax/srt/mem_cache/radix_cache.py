@@ -233,6 +233,20 @@ class RadixCache(BasePrefixCache):
                 host_hit_length=0,
             )
 
+        # Cheap miss check before converting the whole key: under EAGLE/NEXTN
+        # key_convert_fn builds one tuple per token (~100K for a 100K prompt),
+        # which is wasted work when this dp_rank has nothing cached for the
+        # first page. Only the first page_size + 1 tokens are converted here.
+        first_child_key = self._first_child_key(key)
+        if first_child_key is None or first_child_key not in self.root_node.children:
+            return MatchResult(
+                device_indices=np.empty((0,), dtype=np.int32),
+                last_device_node=self.root_node,
+                last_host_node=self.root_node,
+                best_match_node=self.root_node,
+                host_hit_length=0,
+            )
+
         # Convert and align key
         converted_key = RadixKey(self.key_convert_fn(key.token_ids), key.extra_key, key.dp_rank)
 
@@ -265,6 +279,63 @@ class RadixCache(BasePrefixCache):
             best_match_node=last_node,
             host_hit_length=0,
         )
+
+    def _first_child_key(self, key: RadixKey):
+        """Root-level child key for ``key``'s first page, converting at most
+        ``page_size + 1`` tokens. ``None`` if the key is shorter than one page.
+
+        Works for both raw token ids and keys already converted by
+        ``key_convert_fn`` (the bigram converter passes tuples through).
+        """
+        need = self.page_size
+        head = self.key_convert_fn(key.token_ids[: need + 1])[:need]
+        if len(head) < need:
+            return None
+        return self.get_child_key_fn(RadixKey(head, key.extra_key, key.dp_rank))
+
+    def prepare_probe_key(self, token_ids: list[int]) -> list:
+        """Convert ``token_ids`` into this cache's key space once.
+
+        DP routing probes the same prompt against every dp_rank; passing the
+        converted key to each probe avoids rebuilding it per rank (the bigram
+        converter returns already-converted keys unchanged).
+        """
+        return self.key_convert_fn(token_ids)
+
+    def match_prefix_len(self, key: RadixKey) -> int:
+        """Length of the cached prefix for ``key`` on its dp_rank.
+
+        Same value as ``len(self.match_prefix(...).device_indices)`` but meant
+        for read-only probes such as DP routing: it does not concatenate the
+        matched KV indices into an array, does not split nodes and does not
+        touch LRU timestamps, and returns early when the rank has nothing
+        cached for the first page.
+        """
+        if self.disable or len(key) == 0:
+            return 0
+        first_child_key = self._first_child_key(key)
+        if first_child_key is None or first_child_key not in self.root_node.children:
+            return 0
+
+        converted = self.key_convert_fn(key.token_ids)
+        n = len(converted)
+        if self.page_size != 1:
+            n = n // self.page_size * self.page_size
+        rest = RadixKey(converted[:n], key.extra_key, key.dp_rank)
+
+        node = self.root_node
+        matched = 0
+        while len(rest) > 0:
+            child = node.children.get(self.get_child_key_fn(rest))
+            if child is None:
+                break
+            prefix_len = self.key_match_fn(child.key, rest)
+            matched += prefix_len
+            if prefix_len < len(child.key):
+                break
+            node = child
+            rest = rest[prefix_len:]
+        return matched
 
     def insert(self, params: InsertParams) -> int:
         key = params.key

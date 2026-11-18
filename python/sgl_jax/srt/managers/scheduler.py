@@ -941,10 +941,31 @@ class Scheduler(
         """
         if self.tree_cache is None:
             return 0
+        if self._can_fast_probe_prefix():
+            return self.tree_cache.match_prefix_len(RadixKey(token_ids, extra_key, dp_rank))
         result = self.tree_cache.match_prefix(
             MatchPrefixParams(key=RadixKey(token_ids, extra_key, dp_rank))
         )
         return len(result.device_indices) + max(0, int(result.host_hit_length))
+
+    def _can_fast_probe_prefix(self) -> bool:
+        """True when the tree cache is a plain RadixCache (no HiCache host
+        tier, no overridden match_prefix), so ``match_prefix_len`` gives the
+        same length as ``match_prefix`` without its allocations/side effects."""
+        from sgl_jax.srt.mem_cache.radix_cache import RadixCache
+
+        tc = self.tree_cache
+        return (
+            tc is not None
+            and isinstance(tc, RadixCache)
+            and type(tc).match_prefix is RadixCache.match_prefix
+        )
+
+    def _prepare_prefix_probe_key(self, token_ids: list[int]) -> list:
+        """Convert a routing probe key once per request (NEXTN bigram keys)."""
+        if self._can_fast_probe_prefix():
+            return self.tree_cache.prepare_probe_key(token_ids)
+        return token_ids
 
     def _iter_dp_requests(self):
         """Enumerate request owners; DpLoadSnapshot deduplicates shared references.
@@ -1009,6 +1030,7 @@ class Scheduler(
             self._estimate_req_input_output_tokens,
             self._lookup_prefix_length,
             round_robin_start=self.dp_round_robin_counter,
+            prepare_probe_key=self._prepare_prefix_probe_key,
         )
         result = assign_dp_ranks(
             recv_reqs=recv_reqs,
