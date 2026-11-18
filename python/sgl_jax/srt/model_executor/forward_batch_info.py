@@ -330,11 +330,31 @@ class ForwardBatch:
         token dimension in both decode and extend: padded tokens are marked as
         `-1` in `out_cache_loc`.
 
+        Speculative TARGET_VERIFY / DRAFT_EXTEND batches are handled first and
+        never use `out_cache_loc`: there it holds the KV slots newly allocated
+        this round (the overlap scheduler reserves ``2 * ALLOC_LEN_PER_DECODE``
+        per request and the buffer is padded to ``per_dp_bs * draft * 2``), so
+        it is neither the same length as the token dimension nor aligned with
+        it row-by-row. Instead each request owns ``num_tokens // bs``
+        consecutive rows (one per draft token) and dummy DP / bucket-padding
+        slots have ``seq_len == 0``, so the mask is
+        ``repeat(seq_lens > 0, num_tokens // bs)``.
+
         If ``out_sharding`` is provided, the mask is resharded to it before
         return (caller's responsibility to construct a 1D sharding compatible
         with their downstream broadcast operands).
         """
-        if self.out_cache_loc is not None and self.out_cache_loc.shape == (num_tokens,):
+        if (
+            self.forward_mode is not None
+            and self.forward_mode.is_spec_extend()
+            and self.seq_lens is not None
+            and self.seq_lens.ndim == 1
+            and self.seq_lens.shape[0] > 0
+            and num_tokens % self.seq_lens.shape[0] == 0
+        ):
+            rows_per_req = num_tokens // self.seq_lens.shape[0]
+            mask = jnp.repeat(self.seq_lens > 0, rows_per_req, total_repeat_length=num_tokens)
+        elif self.out_cache_loc is not None and self.out_cache_loc.shape == (num_tokens,):
             mask = self.out_cache_loc > 0
         elif (
             self.seq_lens is not None

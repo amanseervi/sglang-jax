@@ -943,6 +943,7 @@ class Glm5DecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
+        token_valid_mask: jax.Array | None = None,
         dispatch_info: ExpertLocationMetadata | None = None,
         dsa_topk_in: jax.Array | None = None,
         dsa_topk_pages_in: jax.Array | None = None,
@@ -984,6 +985,12 @@ class Glm5DecoderLayer(nnx.Module):
                 correction_bias,
                 dispatch_info=dispatch_info,
             )
+            # Drop padded rows (dummy DP slots / bucket padding) from fused MoE
+            # dispatch. Without this they are routed like real tokens; since
+            # they are identical they pile onto the same few experts and the
+            # busiest EP device sets the step time.
+            if self.use_fused and token_valid_mask is not None:
+                topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
             hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
 
@@ -1040,6 +1047,7 @@ class Glm5Model(nnx.Module):
         from sgl_jax.srt.layers.attention.dsa_sparse_backend import DSAFusedCache
 
         hidden_states = self.embed_tokens(forward_batch.input_ids)
+        token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
         cos_sin = (
             self.layers[0].self_attn.rotary_emb.compute_cos_sin(forward_batch.positions)
             if len(self.layers) > 0
@@ -1058,6 +1066,7 @@ class Glm5Model(nnx.Module):
                 forward_batch,
                 token_to_kv_pool,
                 residual,
+                token_valid_mask=token_valid_mask,
                 dispatch_info=forward_batch.expert_location_metadata,
                 dsa_topk_in=dsa_topk,
                 dsa_topk_pages_in=dsa_topk_pages,
@@ -1600,6 +1609,7 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         from sgl_jax.srt.layers.attention.dsa_sparse_backend import DSAFusedCache
 
         embed = self.embed_tokens(forward_batch.input_ids)
+        token_valid_mask = forward_batch.get_token_valid_mask(embed.shape[0])
         hidden_in = forward_batch.spec_info.hidden_states
         emb_sh = jax.typeof(embed).sharding
         if isinstance(emb_sh, jax.sharding.NamedSharding):
@@ -1620,6 +1630,7 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
             forward_batch,
             token_to_kv_pool,
             None,
+            token_valid_mask=token_valid_mask,
             dispatch_info=forward_batch.expert_location_metadata,
             dsa_topk_in=None,
             dsa_topk_pages_in=dsa_topk_pages_in,
